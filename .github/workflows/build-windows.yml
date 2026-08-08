@@ -1,0 +1,123 @@
+name: Build Windows (unsigned)
+
+# Fork-friendly Windows package build.
+# Does not require TAURI_SIGNING_PRIVATE_KEY / Apple secrets.
+# Uploads NSIS/MSI (or bare exe fallback) as workflow artifacts.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/count-tokens-passthrough
+      - build/**
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+          node --version
+          pnpm --version
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-store-
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-build-
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Backend unit tests (proxy)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib count_tokens -- --nocapture
+
+      - name: Build Tauri app (unsigned Windows)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Disable updater artifact generation so the build does not need
+          # TAURI_SIGNING_PRIVATE_KEY (forks typically lack release secrets).
+          pnpm tauri build --bundles nsis,msi --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}'
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find src-tauri/target -type f \( \
+            -name '*.exe' -o -name '*.msi' -o -name '*.nsis.zip' -o -name '*.zip' \
+          \) 2>/dev/null | head -100 || true
+
+          # Prefer installers under bundle/
+          while IFS= read -r -d '' f; do
+            cp -f "$f" release-assets/
+          done < <(find src-tauri/target -type f \( -name '*.msi' -o -name '*-setup.exe' -o -name '*.nsis.zip' \) -print0 2>/dev/null || true)
+
+          # Fallback: bare app exe from release output
+          if [ -z "$(ls -A release-assets 2>/dev/null || true)" ]; then
+            for f in \
+              src-tauri/target/release/cc-switch.exe \
+              src-tauri/target/x86_64-pc-windows-msvc/release/cc-switch.exe
+            do
+              if [ -f "$f" ]; then
+                cp -f "$f" release-assets/
+              fi
+            done
+          fi
+
+          echo "=== release-assets ==="
+          ls -lah release-assets || true
+          if [ -z "$(ls -A release-assets 2>/dev/null || true)" ]; then
+            echo "No Windows artifacts found" >&2
+            find src-tauri/target -maxdepth 5 -type f 2>/dev/null | head -80 || true
+            exit 1
+          fi
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-switch-windows-x64
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
