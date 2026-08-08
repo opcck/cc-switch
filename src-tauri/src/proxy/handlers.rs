@@ -160,8 +160,9 @@ pub async fn handle_claude_desktop_models(
 
 /// 处理 `/v1/messages/count_tokens`（Claude API）
 ///
-/// 始终透传到上游：只做供应商选择 / 模型映射 / 鉴权，不做 openai/gemini 格式转换。
-/// 上游若不支持该接口，会把上游错误原样返回给客户端。
+/// - Anthropic 真上游：透传 `POST /v1/messages/count_tokens`
+/// - openai/gemini 等转换格式：本地启发式估算（上游通常没有该接口）
+/// - 真上游 404/405：回退本地估算，避免 Claude Desktop 再打 max_tokens=1 探测
 pub async fn handle_count_tokens(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
@@ -218,14 +219,28 @@ async fn handle_count_tokens_for_app(
         .and_then(|prefix| raw_endpoint.strip_prefix(prefix))
         .unwrap_or(raw_endpoint);
 
-    // count_tokens 是非流式探测接口，不参与 messages 的格式转换分支。
+    let api_format = get_claude_api_format(&ctx.provider);
+
+    // Transform formats (openai_chat / openai_responses / gemini_native) almost
+    // never expose Anthropic count_tokens. Answering locally prevents Desktop
+    // from falling back to a storm of max_tokens=1 /v1/responses probes.
+    if !super::token_counter::api_format_supports_upstream_count_tokens(api_format) {
+        let input_tokens = super::token_counter::estimate_anthropic_count_tokens(&body);
+        log::info!(
+            "[{tag}] count_tokens local estimate: input_tokens={input_tokens}, api_format={api_format}, provider={}",
+            ctx.provider.name
+        );
+        return Ok(local_count_tokens_response(input_tokens));
+    }
+
+    // Anthropic-compatible upstream: try real count_tokens first.
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
         .forward_with_retry(
             &app_type,
             method,
             endpoint,
-            body,
+            body.clone(),
             headers,
             extensions,
             ctx.get_providers(),
@@ -237,6 +252,15 @@ async fn handle_count_tokens_for_app(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
+            if count_tokens_should_fallback_locally(&err.error) {
+                let input_tokens = super::token_counter::estimate_anthropic_count_tokens(&body);
+                log::warn!(
+                    "[{tag}] count_tokens upstream unavailable ({}); local fallback input_tokens={input_tokens}, provider={}",
+                    err.error,
+                    ctx.provider.name
+                );
+                return Ok(local_count_tokens_response(input_tokens));
+            }
             log_forward_error(&state, &ctx, false, &err.error);
             return Err(err.error);
         }
@@ -246,7 +270,7 @@ async fn handle_count_tokens_for_app(
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
 
-    // 始终透传响应（不做 Claude openai/gemini transform）
+    // 透传响应（不做 Claude openai/gemini transform）
     process_response(
         result.response,
         &ctx,
@@ -255,6 +279,22 @@ async fn handle_count_tokens_for_app(
         connection_guard,
     )
     .await
+}
+
+fn local_count_tokens_response(input_tokens: u64) -> axum::response::Response {
+    (
+        StatusCode::OK,
+        Json(super::token_counter::count_tokens_response(input_tokens)),
+    )
+        .into_response()
+}
+
+/// 404/405 (and some gateways' 501) mean "no count_tokens route" — safe to estimate.
+fn count_tokens_should_fallback_locally(error: &ProxyError) -> bool {
+    match error {
+        ProxyError::UpstreamError { status, .. } => matches!(*status, 404 | 405 | 501),
+        _ => false,
+    }
 }
 
 async fn handle_messages_for_app(
